@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/go-git/go-git/v5 v5.19.1
+	github.com/go-git/go-git/v5 v5.19.2
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/konveyor/agentic-controller/api v0.0.0
 	github.com/konveyor/tackle2-hub/shared v0.0.0-20260718010151-0438af807703
