@@ -7,6 +7,21 @@
 # --- Build stage ---
 FROM golang:1.26 AS builder
 
+# Install Rust for building goose
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && apt-get update && apt-get install -y pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Build goose from source
+ARG GOOSE_VERSION=v1.45.0
+WORKDIR /src/goose
+RUN git clone https://github.com/block/goose.git . \
+    && git checkout ${GOOSE_VERSION} \
+    && cargo build --release \
+    && mv target/release/goose /usr/local/bin/goose
+
 # The harness replaces github.com/konveyor/agentic-controller/api with ../api,
 # so that module has to be in the image at the path the replace names, laid out
 # the same way it is in the repository. Manifests first, so the download layer
@@ -42,17 +57,8 @@ RUN dnf install -y \
 
 ENV PYTHONUNBUFFERED=1
 
-# Install Goose (Block's LLM orchestrator)
-ARG GOOSE_VERSION=v1.45.0
-RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then GOOSE_ARCH="x86_64-unknown-linux-gnu"; \
-       elif [ "$ARCH" = "aarch64" ]; then GOOSE_ARCH="aarch64-unknown-linux-gnu"; \
-       else echo "Unsupported architecture: $ARCH" && exit 1; fi \
-    && curl -fsSL "https://github.com/block/goose/releases/download/${GOOSE_VERSION}/goose-${GOOSE_ARCH}.tar.bz2" -o /tmp/goose.tar.bz2 \
-    && tar -xjf /tmp/goose.tar.bz2 -C /tmp \
-    && mv /tmp/goose /usr/local/bin/goose \
-    && chmod +x /usr/local/bin/goose \
-    && rm -f /tmp/goose.tar.bz2
+# Copy goose binary from builder
+COPY --from=builder /usr/local/bin/goose /usr/local/bin/goose
 
 ENV PATH="/opt/migration-harness/bin:${PATH}"
 ENV HARNESS_WORK_DIR=/workspace/repo
