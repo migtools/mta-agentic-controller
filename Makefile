@@ -51,6 +51,14 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..." paths="./api/..."
 
+.PHONY: generate-adr-index
+generate-adr-index: ## Generate the ADR index and reconciliation table from ADR front matter.
+	hack/generate-adr-index.sh
+
+.PHONY: verify-adr-index
+verify-adr-index: ## Verify that generated ADR indexes match ADR front matter.
+	hack/generate-adr-index.sh --check
+
 .PHONY: fmt
 fmt: ## Run go fmt against code.
 	go fmt ./...
@@ -154,7 +162,7 @@ controller-agent-push: controller-agent-build ## Build and push the controller's
 	$(CONTAINER_TOOL) push $(CONTROLLER_AGENT_IMG)
 
 .PHONY: agent-base-build
-agent-base-build: ## Build the base agent image (goose + git + Python + graphify + harness binary).
+agent-base-build: ## Build the base agent image (goose + git + harness binary).
 	$(CONTAINER_TOOL) build -t $(AGENT_BASE_IMG) -f images/agent-base/Containerfile .
 
 .PHONY: agent-java-build

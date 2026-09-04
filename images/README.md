@@ -1,5 +1,9 @@
 # Container Images
 
+For end-to-end authoring instructions, see
+[Creating agentic base images](../docs/agent-base-images.md) and
+[Creating SkillCard images](../docs/skill-card-images.md).
+
 ## agentic-controller-agent
 
 Minimal agent image owned by the controller for verification and
@@ -22,7 +26,7 @@ Production agent image hierarchy. Skills are mounted at runtime via
 SkillCards, not baked into images.
 
 ```text
-agent-base             UBI 10 + goose CLI + git + Python 3 + graphify + harness binary
+agent-base             UBI 10 + goose CLI + git + harness binary
 ├── agent-java         + JDK 21, Maven
 ├── agent-go           + Go toolchain
 ├── agent-csharp       + .NET SDK
@@ -68,7 +72,7 @@ shared `build-push-images.yaml` reusable workflow:
   so an unusable skill never ships. Everything under `catalog/skills/` ships;
   the worked examples in `catalog/examples/` and the repo's maintainer
   workflow skills in `skills/` are outside that context and never ship
-  (see ADR 0017).
+  (see ADR 0019).
 
 The tag is derived from the ref by the reusable workflow:
 

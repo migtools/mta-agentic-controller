@@ -68,6 +68,14 @@ const (
 	// AgentRunReasonRunning — the agent process is executing; Succeeded
 	// is Unknown until the run ends.
 	AgentRunReasonRunning = "Running"
+	// AgentRunReasonStartupDeadlineExceeded — the run's pod did not reach
+	// a running state within the startup deadline (see
+	// AgentRunSpec.StartupDeadlineSeconds). Pairs with Succeeded=False.
+	// Fatal pod-level startup failures instead surface the kubelet's own
+	// waiting reason verbatim (ImagePullBackOff, CrashLoopBackOff,
+	// InvalidImageName, CreateContainerConfigError) so the reason
+	// vocabulary matches what an operator sees on the pod.
+	AgentRunReasonStartupDeadlineExceeded = "StartupDeadlineExceeded"
 )
 
 // ParamValue supplies a value for a declared Agent parameter.
@@ -143,6 +151,30 @@ type AgentRunSpec struct {
 	// harness default.
 	// +optional
 	GitConfig *GitConfig `json:"gitConfig,omitempty"`
+
+	// TTLSecondsAfterFinished limits the lifetime of an AgentRun that has
+	// reached a terminal phase (Succeeded or Failed), mirroring Job's
+	// ttlSecondsAfterFinished. When set, the controller deletes the run this
+	// many seconds after it finished — cascading to everything it owns
+	// (Sandbox, pod, per-run ConfigMaps/Secrets) via owner references — so
+	// terminal runs do not accumulate. Zero deletes as soon as the run
+	// finishes. When unset, the run is kept until deleted manually, unless the
+	// controller is configured with a default TTL.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+
+	// StartupDeadlineSeconds bounds how long a run may take to reach a
+	// running state before the controller fails it, guarding against pods
+	// that never start — stuck unschedulable or on a slow image pull.
+	// Measured from Sandbox creation. Fatal pod errors (ImagePullBackOff,
+	// CrashLoopBackOff, InvalidImageName, CreateContainerConfigError) fail
+	// the run immediately regardless of this deadline. 0 or unset uses the
+	// controller default (--agentrun-startup-deadline); when neither is
+	// set, no deadline is enforced and only fatal pod errors fail the run.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	StartupDeadlineSeconds *int32 `json:"startupDeadlineSeconds,omitempty"`
 }
 
 // AgentRunStatus defines the observed state of an AgentRun.

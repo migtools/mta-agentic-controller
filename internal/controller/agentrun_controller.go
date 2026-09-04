@@ -26,6 +26,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -147,6 +148,21 @@ type AgentRunReconciler struct {
 	// loader of the same version.
 	SkillLoaderImage string
 
+	// DefaultTTLAfterFinished, when non-nil, is the fallback lifetime applied
+	// to a terminal AgentRun whose spec does not set TTLSecondsAfterFinished.
+	// The controller deletes such a run this long after it finished. Nil
+	// disables the default (runs are kept until deleted). A run's own
+	// spec.ttlSecondsAfterFinished always overrides this. Wired from the
+	// --agentrun-ttl flag in main.
+	DefaultTTLAfterFinished *time.Duration
+
+	// DefaultStartupDeadline bounds how long a run may take to reach a
+	// running state before it is failed with StartupDeadlineExceeded, for
+	// runs that do not set spec.startupDeadlineSeconds. Nil or zero means
+	// no default deadline; fatal pod errors still fail runs immediately.
+	// Set from --agentrun-startup-deadline.
+	DefaultStartupDeadline *time.Duration
+
 	// apiReader reads directly from the API server, bypassing the manager
 	// cache. It is used only for the best-effort pod termination-message
 	// lookup: a direct read avoids surfacing a stale generic message when
@@ -186,10 +202,10 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	original := run.DeepCopy()
 	run.Status.ObservedGeneration = run.Generation
 
-	// If the run is already terminal, nothing to do.
-	if run.Status.Phase == konveyoriov1alpha1.AgentRunPhaseSucceeded ||
-		run.Status.Phase == konveyoriov1alpha1.AgentRunPhaseFailed {
-		return ctrl.Result{}, nil
+	// A terminal run has no execution work left; the only remaining action is
+	// TTL-based garbage collection (delete once the run's lifetime elapses).
+	if isTerminalPhase(run.Status.Phase) {
+		return r.reconcileTTL(ctx, &run, original)
 	}
 
 	// Shed the legacy Ready condition on any live run created before it was
@@ -289,9 +305,14 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Update AgentRun phase and ACP readiness from the Sandbox and its pod.
-	r.updatePhaseFromSandbox(ctx, &run, &sandbox, pod)
+	// A non-zero requeue enforces the startup deadline without relying on a
+	// pod event that may never come (e.g. a pod stuck unschedulable).
+	requeueAfter := r.updatePhaseFromSandbox(ctx, &run, &sandbox, pod)
 
-	return r.patchRunStatus(ctx, &run, original)
+	if _, err := r.patchRunStatus(ctx, &run, original); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // validateParams checks that supplied params match Agent declarations
@@ -1170,26 +1191,20 @@ func skillLoaderContainer(image string, sources *skillSources, mounts []corev1.V
 // separate fact — the sandbox pod's tcpSocket:4000 readiness probe feeding
 // the Sandbox Ready condition — and is reported as the ACPReady condition,
 // so a client dials on ACPReady=True, never on Phase.
+//
+// It returns the duration after which the run should be re-reconciled, or
+// 0 for none. A non-zero requeue enforces the startup deadline for a pod
+// that is slow to start without depending on a pod event.
 func (r *AgentRunReconciler) updatePhaseFromSandbox(
 	ctx context.Context,
 	run *konveyoriov1alpha1.AgentRun,
 	sandbox *sandboxv1beta1.Sandbox,
 	pod *corev1.Pod,
-) {
+) time.Duration {
 	// Check Sandbox conditions for Finished state.
 	for _, cond := range sandbox.Status.Conditions {
 		if cond.Type == sandboxConditionFinished && cond.Status == metav1.ConditionTrue {
-			now := metav1.Now()
-			run.Status.CompletionTime = &now
-			if run.Status.StartTime == nil {
-				// Finished before we ever saw the pod running: the pod's
-				// own start, else the Sandbox creation, so Duration still
-				// reflects the run's wall time.
-				start := podStartTime(pod, sandbox.CreationTimestamp)
-				run.Status.StartTime = &start
-			}
-			duration := int64(now.Sub(run.Status.StartTime.Time).Seconds())
-			run.Status.Duration = &duration
+			stampCompletion(run, pod, sandbox)
 			meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 				Type:               konveyoriov1alpha1.AgentRunConditionACPReady,
 				Status:             metav1.ConditionFalse,
@@ -1208,7 +1223,7 @@ func (r *AgentRunReconciler) updatePhaseFromSandbox(
 			// the termination log (e.g. a non-git source, #143); surface it
 			// on the failure outcome, preferring it over the generic reason.
 			r.setTerminalOutcome(run, pod, cond.Reason, r.lookupTerminationMessage(ctx, run))
-			return
+			return 0
 		}
 	}
 
@@ -1236,23 +1251,156 @@ func (r *AgentRunReconciler) updatePhaseFromSandbox(
 	// pod is Running. One-way — a later pod state change does not regress
 	// a Running run.
 	if run.Status.Phase == konveyoriov1alpha1.AgentRunPhaseRunning {
-		return
+		return 0
 	}
+
+	// Fail-fast: a pod that cannot start (image pull, container config, or
+	// crash loop) will never reach Running, so fail the run now instead of
+	// waiting on it. Checked before the pod-phase gate because a container
+	// stuck in CrashLoopBackOff can still put the pod in the Running phase.
+	if reason, message, fatal := podStartupProblem(pod); fatal {
+		run.Status.Phase = konveyoriov1alpha1.AgentRunPhaseFailed
+		stampCompletion(run, pod, sandbox)
+		setRunSucceeded(run, metav1.ConditionFalse, reason, message)
+		return 0
+	}
+
 	if pod == nil || pod.Status.Phase != corev1.PodRunning {
-		run.Status.Phase = konveyoriov1alpha1.AgentRunPhasePending
-		podPhase := "not created yet"
-		if pod != nil {
-			podPhase = string(pod.Status.Phase)
+		// The pod is not running yet. If a startup deadline is configured
+		// and has elapsed, fail the run; otherwise stay Pending and requeue
+		// so the deadline is enforced even absent a further pod event.
+		if deadline, ok := r.effectiveStartupDeadline(run); ok {
+			remaining := deadline - time.Since(sandbox.CreationTimestamp.Time)
+			if remaining <= 0 {
+				run.Status.Phase = konveyoriov1alpha1.AgentRunPhaseFailed
+				stampCompletion(run, pod, sandbox)
+				detail := podStartupDetail(pod)
+				setRunSucceeded(run, metav1.ConditionFalse,
+					konveyoriov1alpha1.AgentRunReasonStartupDeadlineExceeded,
+					fmt.Sprintf("Pod %q did not reach a running state within %s: %s",
+						sandbox.Name, deadline, detail))
+				return 0
+			}
+			run.Status.Phase = konveyoriov1alpha1.AgentRunPhasePending
+			setRunSucceeded(run, metav1.ConditionUnknown, "PodNotRunning",
+				fmt.Sprintf("Waiting for sandbox pod %q to run (%s)",
+					sandbox.Name, podStartupDetail(pod)))
+			return remaining
 		}
+		run.Status.Phase = konveyoriov1alpha1.AgentRunPhasePending
 		setRunSucceeded(run, metav1.ConditionUnknown, "PodNotRunning",
-			fmt.Sprintf("Waiting for sandbox pod %q to run (%s)", sandbox.Name, podPhase))
-		return
+			fmt.Sprintf("Waiting for sandbox pod %q to run (%s)",
+				sandbox.Name, podStartupDetail(pod)))
+		return 0
 	}
 	run.Status.Phase = konveyoriov1alpha1.AgentRunPhaseRunning
 	start := podStartTime(pod, sandbox.CreationTimestamp)
 	run.Status.StartTime = &start
 	setRunSucceeded(run, metav1.ConditionUnknown, konveyoriov1alpha1.AgentRunReasonRunning,
 		"Agent is running")
+	return 0
+}
+
+// stampCompletion records the terminal timing on a finished run: the
+// completion time now, a start-time fallback for runs that finished before
+// the pod was ever seen running, and the resulting duration.
+func stampCompletion(run *konveyoriov1alpha1.AgentRun, pod *corev1.Pod, sandbox *sandboxv1beta1.Sandbox) {
+	now := metav1.Now()
+	run.Status.CompletionTime = &now
+	if run.Status.StartTime == nil {
+		// Finished before we ever saw the pod running: the pod's own start,
+		// else the Sandbox creation, so Duration still reflects wall time.
+		start := podStartTime(pod, sandbox.CreationTimestamp)
+		run.Status.StartTime = &start
+	}
+	duration := int64(now.Sub(run.Status.StartTime.Time).Seconds())
+	run.Status.Duration = &duration
+}
+
+// fatalWaitingReasons are container Waiting.Reason values that mean the pod
+// will not start without intervention: the image cannot be pulled or named,
+// the container cannot be configured, or it crashes on every start. They are
+// settled states — kubelet has already retried into a back-off, or the
+// config is permanently wrong — so the run is failed rather than waited on.
+//
+// CrashLoopBackOff is effectively unreachable today: sandbox pods run with
+// RestartPolicyNever, so a crashing container terminates (surfaced through the
+// Sandbox Finished / setTerminalOutcome path) rather than entering a waiting
+// back-off. It is kept as a guard against a future restart-policy change.
+var fatalWaitingReasons = map[string]bool{
+	"ImagePullBackOff":           true,
+	"InvalidImageName":           true,
+	"CreateContainerConfigError": true,
+	"CrashLoopBackOff":           true,
+}
+
+// podStartupProblem inspects a not-yet-running pod for a fatal startup
+// failure. It returns a machine reason (the kubelet's own waiting reason),
+// a human message naming the container, and fatal=true when the pod will
+// not start on its own. Init containers are checked first: the skill loader
+// runs there, and a bad loader image never lets the agent container start.
+func podStartupProblem(pod *corev1.Pod) (reason, message string, fatal bool) {
+	if pod == nil {
+		return "", "", false
+	}
+	statuses := make([]corev1.ContainerStatus, 0,
+		len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	for _, cs := range statuses {
+		w := cs.State.Waiting
+		if w == nil || !fatalWaitingReasons[w.Reason] {
+			continue
+		}
+		msg := fmt.Sprintf("container %q is stuck on %s", cs.Name, w.Reason)
+		if w.Message != "" {
+			msg = fmt.Sprintf("%s: %s", msg, w.Message)
+		}
+		return w.Reason, msg, true
+	}
+	return "", "", false
+}
+
+// podStartupDetail returns a short human description of why a pod is not
+// running yet, for the deadline-exceeded and Pending messages. It surfaces
+// an unschedulable condition or a container's current waiting reason, and
+// otherwise falls back to the pod phase.
+func podStartupDetail(pod *corev1.Pod) string {
+	if pod == nil {
+		return "pod not created yet"
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse &&
+			c.Reason == corev1.PodReasonUnschedulable {
+			if c.Message != "" {
+				return fmt.Sprintf("unschedulable: %s", c.Message)
+			}
+			return "unschedulable"
+		}
+	}
+	statuses := make([]corev1.ContainerStatus, 0,
+		len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	for _, cs := range statuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			return fmt.Sprintf("container %q: %s", cs.Name, cs.State.Waiting.Reason)
+		}
+	}
+	return fmt.Sprintf("pod phase %s", pod.Status.Phase)
+}
+
+// effectiveStartupDeadline returns the run's startup deadline: its own
+// spec.startupDeadlineSeconds when set to a positive value, else the
+// controller default. ok is false when no deadline applies.
+func (r *AgentRunReconciler) effectiveStartupDeadline(run *konveyoriov1alpha1.AgentRun) (time.Duration, bool) {
+	if run.Spec.StartupDeadlineSeconds != nil && *run.Spec.StartupDeadlineSeconds > 0 {
+		return time.Duration(*run.Spec.StartupDeadlineSeconds) * time.Second, true
+	}
+	if r.DefaultStartupDeadline != nil && *r.DefaultStartupDeadline > 0 {
+		return *r.DefaultStartupDeadline, true
+	}
+	return 0, false
 }
 
 // Harness exit-code contract (ADR 0011/0018). Additional codes may be
@@ -1437,6 +1585,64 @@ func (r *AgentRunReconciler) patchRunStatus(
 	return ctrl.Result{}, nil
 }
 
+// isTerminalPhase reports whether an AgentRun phase is terminal — the run has
+// finished and no further execution work happens.
+func isTerminalPhase(phase konveyoriov1alpha1.AgentRunPhase) bool {
+	return phase == konveyoriov1alpha1.AgentRunPhaseSucceeded ||
+		phase == konveyoriov1alpha1.AgentRunPhaseFailed
+}
+
+// effectiveTTL resolves a terminal AgentRun's lifetime: the run's own
+// spec.ttlSecondsAfterFinished wins, then the controller's
+// DefaultTTLAfterFinished. The bool is false when neither is set, meaning GC
+// is disabled and the run is kept until deleted manually.
+func (r *AgentRunReconciler) effectiveTTL(run *konveyoriov1alpha1.AgentRun) (time.Duration, bool) {
+	if run.Spec.TTLSecondsAfterFinished != nil {
+		return time.Duration(*run.Spec.TTLSecondsAfterFinished) * time.Second, true
+	}
+	if r.DefaultTTLAfterFinished != nil {
+		return *r.DefaultTTLAfterFinished, true
+	}
+	return 0, false
+}
+
+// reconcileTTL garbage-collects a terminal AgentRun once its TTL elapses.
+// With no effective TTL the run is kept. The finish anchor is CompletionTime;
+// a terminal run that never recorded one (e.g. a validation failure before a
+// Sandbox existed) gets it stamped now so expiry is deterministic across
+// controller restarts. Before the TTL elapses the reconcile is requeued for
+// the remaining time; once it has, the run is deleted — cascading to
+// everything it owns (Sandbox, pod, per-run ConfigMaps/Secrets) via owner
+// references.
+func (r *AgentRunReconciler) reconcileTTL(
+	ctx context.Context,
+	run *konveyoriov1alpha1.AgentRun,
+	original *konveyoriov1alpha1.AgentRun,
+) (ctrl.Result, error) {
+	ttl, ok := r.effectiveTTL(run)
+	if !ok {
+		return ctrl.Result{}, nil
+	}
+
+	// Anchor the clock: a terminal run with no CompletionTime records one now.
+	if run.Status.CompletionTime == nil {
+		now := metav1.Now()
+		run.Status.CompletionTime = &now
+		return r.patchRunStatus(ctx, run, original)
+	}
+
+	if remaining := time.Until(run.Status.CompletionTime.Add(ttl)); remaining > 0 {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
+	log.FromContext(ctx).Info("Deleting finished AgentRun (TTL elapsed)",
+		"agentRun", run.Name, "ttl", ttl.String(), "completionTime", run.Status.CompletionTime)
+	if err := r.Delete(ctx, run); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	return ctrl.Result{}, nil
+}
+
 // generateSecretKey generates a random hex-encoded secret key.
 func generateSecretKey() (string, error) {
 	b := make([]byte, secretKeyLength)
@@ -1540,8 +1746,7 @@ func (r *AgentRunReconciler) findRunsForAgent(
 	var requests []reconcile.Request
 	for _, run := range runList.Items {
 		// Only re-reconcile non-terminal runs.
-		if run.Status.Phase == konveyoriov1alpha1.AgentRunPhaseSucceeded ||
-			run.Status.Phase == konveyoriov1alpha1.AgentRunPhaseFailed {
+		if isTerminalPhase(run.Status.Phase) {
 			continue
 		}
 		requests = append(requests, reconcile.Request{
