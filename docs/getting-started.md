@@ -11,7 +11,7 @@ AgentRun to trigger execution.
   Kubernetes 1.33–1.34, so enable `ImageVolume` there; it is on by
   default from 1.35 and GA in 1.36)
 - [Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
-  v0.5.x installed in the cluster
+  v1.0.x installed in the cluster
 - `kubectl` and `helm` configured to talk to the cluster
 - LLM provider credentials (e.g. GCP Vertex AI, OpenAI, Anthropic,
   AWS Bedrock)
@@ -23,15 +23,18 @@ Agent Sandbox must be installed before the controller can execute
 AgentRuns.
 
 ```bash
-AGENT_SANDBOX_TAG=v0.5.5
+AGENT_SANDBOX_TAG=v1.0.0
 
 # Clone and install via Helm
 git clone --depth 1 --branch $AGENT_SANDBOX_TAG \
   https://github.com/kubernetes-sigs/agent-sandbox.git /tmp/agent-sandbox
 
+# The chart renders its own Namespace by default; disable it with
+# namespace.create=false so it does not collide with --create-namespace.
 helm install agent-sandbox /tmp/agent-sandbox/helm/ \
   --namespace agent-sandbox-system \
   --create-namespace \
+  --set namespace.create=false \
   --set image.tag=$AGENT_SANDBOX_TAG
 
 # Wait for the controller to be ready
@@ -50,13 +53,28 @@ kubectl wait deployment/agent-sandbox-controller \
 > v0.5.2 (`manifest.yaml` → `sandbox.yaml`), so pin a v0.5.2+ tag if you
 > follow the release-manifest path.
 
+> **Upgrading an existing cluster:** Agent Sandbox v1.0.0 removes the
+> legacy `v1alpha1` API and its conversion webhooks, so you **cannot**
+> jump straight to it from v0.4.x / early v0.5.x. Follow the upstream
+> [v1.0.0 API migration guide](https://github.com/kubernetes-sigs/agent-sandbox/blob/v1.0.0/docs/api-migration-guide.md)
+> in order: (1) upgrade to a v0.5.x release; (2) run the
+> [v0.5 storage migration](https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.2/docs/api-migration-guide.md)
+> to move all resources to `v1beta1` and prune legacy `storedVersions`;
+> (3) verify every agent-sandbox CRD reports only `["v1beta1"]` in
+> `status.storedVersions` (the apiserver rejects the upgrade otherwise);
+> (4) upgrade to v1.0.0. Because Helm does **not** upgrade CRDs in a
+> chart's `crds/` directory, apply the v1beta1 CRDs
+> (`kubectl apply -f helm/crds/`) *before* `helm upgrade` — otherwise the
+> chart removes the conversion-webhook Service while the old CRDs still
+> reference it. Fresh installs (the command above) are unaffected.
+
 > **Future:** [OpenShell](https://github.com/NVIDIA/OpenShell) will
 > replace the direct Agent Sandbox dependency. When integrated, the
 > controller will provision sandboxes through the OpenShell gateway
 > API instead of creating Sandbox CRs directly. See
 > [ADR 0004](adr/0004-openshell-as-execution-interface.md).
 
-## 2. Deploy the controller and default skills
+## 2. Deploy the controller and default resources
 
 The default image `quay.io/konveyor/agentic-controller:latest` is public
 and rebuilt on every merge to `main`, so you can deploy straight away
@@ -83,12 +101,29 @@ the controller. Verify it's running:
 kubectl get pods -n agentic-controller-system
 ```
 
-Deploy the default SkillCard and SkillCollection resources (these
-are not included in `make deploy` to avoid name-prefix conflicts):
+Deploy the default domain resources — the SkillCards and SkillCollection
+that make up the skill catalog, plus the Agents and the
+`java-ee-to-quarkus` AgentWorkflow the UI presents for users to run
+(these are not included in `make deploy` to avoid name-prefix mangling
+the cross-references between them). This is the same content the operator
+installs on enable:
 
 ```bash
-kubectl apply -k config/samples/
+kubectl apply -k config/defaults/
 ```
+
+The shipped Agents declare no gateway, so they install and become Ready
+without a provider configured — you name a gateway when you run one (step
+3 creates one). Inspect what was installed:
+
+```bash
+kubectl get skillcards,skillcollections,agents,agentworkflows
+```
+
+> **Samples vs. defaults.** `config/defaults/` holds the curated content
+> above — installed automatically by the operator. `config/samples/` holds
+> illustrative CRs you copy and edit (the Gateway samples in step 3, plus a
+> standalone example Agent and AgentRun); nothing there is auto-installed.
 
 To install only the CRDs without deploying the controller (e.g. for
 local development with `make run`):
@@ -289,9 +324,10 @@ AgentWorkflow and AgentWorkflowRun. See
 `hack/harness-test/workflow-resources.yaml` for a complete example
 that migrates a Java EE application to Quarkus using three stages.
 
-## Sample manifests
+## Sample and default manifests
 
-All sample CRs are in `config/samples/`:
+**Samples** (`config/samples/`) are illustrative CRs you copy and edit —
+nothing here is auto-installed:
 
 | File | Kind | Description |
 |------|------|-------------|
@@ -300,10 +336,19 @@ All sample CRs are in `config/samples/`:
 | `gateway_anthropic.yaml` | Gateway | Anthropic direct API |
 | `gateway_aws_bedrock.yaml` | Gateway | AWS Bedrock |
 | `gateway_xai.yaml` | Gateway | xAI (Grok) |
-| `agent_example.yaml` | Agent | Java migration agent |
-| `agentrun_example.yaml` | AgentRun | Triggers the migration agent |
-| `skillcard_*.yaml` | SkillCard | Migration skills (applied via `kubectl apply -k config/samples/`) |
-| `skillcollection_*.yaml` | SkillCollection | Grouped skills (applied via `kubectl apply -k config/samples/`) |
+| `agent_example.yaml` | Agent | Standalone Java migration agent |
+| `agentrun_example.yaml` | AgentRun | Triggers the example agent |
+
+**Defaults** (`config/defaults/`) are the curated content the operator
+installs on enable — the skill catalog plus the Agents and AgentWorkflow
+the UI runs. Apply them with `kubectl apply -k config/defaults/`:
+
+| File | Kind | Description |
+|------|------|-------------|
+| `skillcard_*.yaml` | SkillCard | Migration-stage skills (plan, execute, verify, javaee-to-quarkus, house-rules) |
+| `skillcollection_java_migration.yaml` | SkillCollection | Grouped migration skills |
+| `agent_migration_*.yaml` | Agent | Plan, execute, and verify stage agents (no gateway — named at run time) |
+| `agentworkflow_javaee_to_quarkus.yaml` | AgentWorkflow | Three-stage Java EE → Quarkus workflow |
 
 ## Local development
 
