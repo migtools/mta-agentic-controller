@@ -43,7 +43,9 @@ RUN cargo build --release -p goose-cli --bin goose \
 FROM scratch AS goose-dist
 COPY --from=goose-builder /usr/local/bin/goose /usr/local/bin/goose
 
-FROM ${GOOSE_IMAGE} AS goose
+# goose-dist stage reference (doozer/Konflux rebase counts ${GOOSE_IMAGE} as an
+# external parent). CI/Make substitute a prebuilt image when GOOSE_IMAGE is set.
+FROM goose-dist AS goose
 
 # --- Build stage ---
 FROM golang:1.26 AS builder

@@ -185,7 +185,15 @@ goose-dist-build: ## Build just the goose binary as a standalone image, for reus
 
 .PHONY: agent-base-build
 agent-base-build: ## Build the base agent image (goose + git + harness binary).
-	$(CONTAINER_TOOL) build $(GOOSE_BUILD_ARG) -t $(AGENT_BASE_IMG) -f images/agent-base/Containerfile .
+	@set -e; \
+	containerfile=images/agent-base/Containerfile; \
+	if [ -n "$(GOOSE_IMAGE)" ]; then \
+	  tmp=$$(mktemp); \
+	  sed 's|^FROM goose-dist AS goose|FROM $(GOOSE_IMAGE) AS goose|' "$$containerfile" > "$$tmp"; \
+	  containerfile=$$tmp; \
+	  trap 'rm -f "$$tmp"' EXIT; \
+	fi; \
+	$(CONTAINER_TOOL) build -t $(AGENT_BASE_IMG) -f "$$containerfile" .
 
 .PHONY: agent-java-build
 agent-java-build: agent-base-build ## Build the Java agent image (JDK 21 + Maven).

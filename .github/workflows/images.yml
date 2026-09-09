@@ -100,6 +100,11 @@ jobs:
         id: goose
         uses: ./.github/actions/goose-image
 
+      - name: Point agent-base at prebuilt goose
+        run: |
+          sed -i 's|^FROM goose-dist AS goose|FROM '"${{ steps.goose.outputs.image }}"' AS goose|' \
+            images/agent-base/Containerfile
+
       - name: Build and upload agent-base artifact
         uses: konveyor/ci/build-image@e45ec039d03d41be52ae0c9abef260ee3ae8172a # main
         with:
@@ -109,7 +114,6 @@ jobs:
           image_tag: pr${{ github.event.pull_request.number }}-${{ matrix.arch }}
           dockerfile_path: images/agent-base/Containerfile
           build_context: "."
-          build_args: GOOSE_IMAGE=${{ steps.goose.outputs.image }}
           cache-key-file: harness/go.sum
 
   agent-lang-images-artifact:
