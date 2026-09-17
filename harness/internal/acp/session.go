@@ -111,9 +111,19 @@ func (c *SessionClient) permissionForwarder() PermissionForwarder {
 	return c.forwarder
 }
 
+// acpProtocolVersion is the ACP protocol version this client offers in
+// initialize. It is a u16 on the wire, not a string: goose parses the
+// field as an integer and rejects anything else with
+// `-32602 Invalid params: invalid type: string "0.1", expected u16`.
+// Older goose (1.45, what agent-java:latest carries today) coerced the
+// string quietly and negotiated the session down to ACP v0 instead, so
+// the bug was invisible until a newer goose refused the handshake.
+// Version 1 is accepted by both.
+const acpProtocolVersion = 1
+
 // InitParams are required for the ACP initialize handshake.
 type InitParams struct {
-	ProtocolVersion string     `json:"protocolVersion"`
+	ProtocolVersion int        `json:"protocolVersion"`
 	ClientInfo      ClientInfo `json:"clientInfo"`
 	// ClientCapabilities is the ACP field name (the earlier "capabilities"
 	// spelling was never read by goose). The goose extension point lives
@@ -142,14 +152,15 @@ type InitResult struct {
 
 // Initialize performs the required ACP handshake. Must be called before
 // any session operations. protocolVersion is required — goose returns a
-// parse error without it.
+// parse error without it, and it must be a number (see
+// acpProtocolVersion).
 func (c *SessionClient) Initialize(ctx context.Context) (*InitResult, error) {
 	if c.initialized {
 		return nil, nil
 	}
 
 	result, _, err := c.ws.Call(ctx, "initialize", &InitParams{
-		ProtocolVersion: "0.1",
+		ProtocolVersion: acpProtocolVersion,
 		ClientInfo: ClientInfo{
 			Name:    "migration-harness",
 			Version: "0.1.0",
@@ -394,26 +405,39 @@ var (
 // LooksLikeProviderError reports whether one agent message is, or ends
 // with, one of goose's provider-failure messages. A turn ending on one
 // never reached the model, or lost it mid-way, yet from the outside it
-// looks like an ordinary end of turn. goose emits the failure as its own
-// message, but text it had already streamed can precede it in the same
-// entry when no message id separates them, so prefixes are also checked
-// at the start of each line.
+// looks like an ordinary end of turn.
 func LooksLikeProviderError(text string) bool {
+	return ProviderErrorText(text) != ""
+}
+
+// ProviderErrorText returns the provider-failure message within one agent
+// message, or "" when it holds none (see LooksLikeProviderError). goose
+// emits the failure as its own message, but text it had already streamed
+// can precede it in the same entry when no message id separates them, so
+// prefixes are also checked at the start of each line. That narration is
+// not the error and is left out: the result runs from the line the failure
+// starts on — the line before a trailer, or the last line opening with a
+// prefix — to the end of the message.
+func ProviderErrorText(text string) string {
 	t := strings.TrimSpace(text)
 	for _, m := range providerErrorSuffixes {
 		if strings.HasSuffix(t, m) {
-			return true
+			// body is t up to the trailer (t has no leading space to trim):
+			// the failure starts on its last line, or is the trailer alone.
+			body := strings.TrimSpace(strings.TrimSuffix(t, m))
+			return strings.TrimSpace(t[strings.LastIndex(body, "\n")+1:])
 		}
 	}
-	for line := range strings.SplitSeq(t, "\n") {
-		line = strings.TrimSpace(line)
+	lines := strings.Split(t, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
 		for _, m := range providerErrorPrefixes {
 			if strings.HasPrefix(line, m) {
-				return true
+				return strings.TrimSpace(strings.Join(lines[i:], "\n"))
 			}
 		}
 	}
-	return false
+	return ""
 }
 
 // SendPrompt sends a prompt to a session and collects the streaming

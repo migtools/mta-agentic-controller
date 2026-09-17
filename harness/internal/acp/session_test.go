@@ -300,6 +300,47 @@ func TestInitializeDeclaresGooseCustomNotifications(t *testing.T) {
 	}
 }
 
+// The ACP initialize param protocolVersion is a u16 on the wire. Sending
+// it as the string "0.1" got coerced by goose 1.45 (which then negotiated
+// the session down to ACP v0), but a newer goose rejects the handshake
+// outright with `-32602 Invalid params: invalid type: string "0.1",
+// expected u16`. Pin the JSON type so that cannot come back.
+func TestInitializeSendsNumericProtocolVersion(t *testing.T) {
+	s := newDemuxServer(t)
+	c := s.dial(t)
+	sc := NewSessionClient(c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := sc.Initialize(ctx)
+		done <- err
+	}()
+
+	req := s.next()
+	params, _ := req["params"].(map[string]any)
+	got, ok := params["protocolVersion"].(float64)
+	if !ok {
+		t.Fatalf("protocolVersion must be a JSON number, got %#v: %v", params["protocolVersion"], params)
+	}
+	if int(got) != acpProtocolVersion {
+		t.Fatalf("protocolVersion = %v, want %d", got, acpProtocolVersion)
+	}
+
+	rawID, ok := req["id"].(float64)
+	if !ok {
+		t.Fatalf("initialize request carried no numeric id: %v", req)
+	}
+	s.push(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":%d,"agentCapabilities":{}}}`,
+		int64(rawID), acpProtocolVersion))
+
+	if err := <-done; err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+}
+
 type stubForwarder struct {
 	result  json.RawMessage
 	outcome PermissionForwardOutcome
@@ -827,5 +868,24 @@ func TestLooksLikeProviderError(t *testing.T) {
 	r.appendClosing("Ran into this error: 503.\n\nPlease retry if you think this is a transient or recoverable error.", "m2")
 	if !r.ClosingProviderError() {
 		t.Fatal("provider error in a later message not detected")
+	}
+}
+
+// The failure text leaves out narration streamed ahead of it, so what a
+// person is shown is the error, not "Here is the plan:".
+func TestProviderErrorText(t *testing.T) {
+	retry := "\n\nPlease retry if you think this is a transient or recoverable error."
+	cases := []struct{ in, want string }{
+		{"Ran into this error: 503." + retry, "Ran into this error: 503." + retry},
+		{"Here is the plan:\n1. Update pom.xml\nRan into this error: ThrottlingException." + retry, "Ran into this error: ThrottlingException." + retry},
+		{"Here is the plan:\nConnection reset by peer\n\nPlease resend your message to try again.", "Connection reset by peer\n\nPlease resend your message to try again."},
+		{"Please resend your message to try again.", "Please resend your message to try again."},
+		{"The build log said \"Ran into this error: missing jakarta import\"; fixed in 2 files.", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := ProviderErrorText(c.in); got != c.want {
+			t.Errorf("ProviderErrorText(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
