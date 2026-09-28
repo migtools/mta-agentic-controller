@@ -12,53 +12,13 @@ outputs:
 runs:
   using: composite
   steps:
-    # Everything that decides what the binary is lives between the GOOSE_IMAGE
-    # arg and the stage that consumes it: the builder base, the build deps, the
-    # source repo, the version and the cargo invocation. Key on a hash of just
-    # that region, so editing the harness half of the Containerfile does not
-    # throw away a 35 minute compile.
-    #
-    # GOOSE_VERSION is inside that region, so a bump already changes the hash.
-    # It goes in the key as well because a bare hash tells you nothing on the
-    # Actions cache page or in a build log, and the version is the thing anyone
-    # looking at either actually wants to know.
     - name: Derive the cache key
       id: key
       shell: bash
-      env:
-        CONTAINERFILE: images/agent-base/Containerfile
       run: |
-        region=$(sed -n '/^ARG GOOSE_IMAGE=/,/^FROM .* AS goose$/p' "${CONTAINERFILE}")
-
-        # sed's range prints to EOF when the end address never matches, so a
-        # renamed, lowercased or reflowed "AS goose" line would silently widen
-        # the region to the whole file -- putting the harness stages back in
-        # the key and bringing the compile back on every push, with nothing to
-        # point at. Check the region actually ends where it is supposed to.
-        case "$(printf '%s\n' "${region}" | tail -1)" in
-          "FROM "*" AS goose") ;;
-          *)
-            echo "Could not read the goose stages out of ${CONTAINERFILE}."
-            echo "Expected a region from 'ARG GOOSE_IMAGE=' to 'FROM ... AS goose'."
-            exit 1
-            ;;
-        esac
-
-        # This ends up in an image tag and, via images.yml, in build-image's
-        # unquoted build_args loop. A trailing comment on the ARG line is
-        # enough to produce "invalid reference format" 30 minutes in.
-        version=$(printf '%s\n' "${region}" | sed -n 's/^ARG GOOSE_VERSION=//p' | head -1)
-        case "${version}" in
-          '' | [-.]* | *[!A-Za-z0-9._-]*)
-            echo "Expected 'ARG GOOSE_VERSION=<tag>' in the goose stages of ${CONTAINERFILE}."
-            echo "Got: '${version}'"
-            exit 1
-            ;;
-        esac
-
-        digest=$(printf '%s\n' "${region}" | sha256sum | cut -c1-16)
-        echo "cache-key=goose-dist-${RUNNER_OS}-${RUNNER_ARCH}-${version}-${digest}" >> "$GITHUB_OUTPUT"
-        echo "image=localhost/goose-dist:${version}-${digest}" >> "$GITHUB_OUTPUT"
+        key=$(bash images/agent-base/patches/cache-key.sh)
+        echo "cache-key=goose-dist-${RUNNER_OS}-${RUNNER_ARCH}-${key}" >> "$GITHUB_OUTPUT"
+        echo "image=localhost/goose-dist:${key}" >> "$GITHUB_OUTPUT"
 
     # restore + save rather than actions/cache, which only saves from a post
     # step gated on post-if: success(). A cold run that compiles for 35 minutes
@@ -104,6 +64,21 @@ runs:
         chmod +x /tmp/crun
         /tmp/crun --version | head -1 | grep -q "crun version ${CRUN_MIN}"
         sudo mv /tmp/crun /usr/bin/crun
+
+    # On a cache miss the compile needs the submodule's actual contents. If the
+    # calling workflow checked out without submodules the directory is empty,
+    # COPY silently copies nothing, and the first thing to notice is git apply
+    # reporting "crates/goose/Cargo.toml: No such file or directory" a couple
+    # of minutes into the container build. Say what is actually wrong instead.
+    - name: Check the goose submodule is populated
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        if [ ! -f images/agent-base/goose-src/Cargo.toml ]; then
+          echo "images/agent-base/goose-src is empty, so goose cannot be compiled."
+          echo "Add 'submodules: true' to this job's actions/checkout step."
+          exit 1
+        fi
 
     - name: Compile goose
       if: steps.cache.outputs.cache-hit != 'true'

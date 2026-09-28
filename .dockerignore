@@ -6,10 +6,13 @@ docs/
 hack/
 images/
 !images/agent-base/goose-src/
+!images/agent-base/patches/
 skills/
 test/
 changes/
 .git/
+**/.git
+**/target/
 .github/
 .claude/
 .cursor/

@@ -1,0 +1,9 @@
+kind: bugfix
+description: >
+  Build the Goose binary in the agent images against the system OpenSSL
+  instead of bundling its own crypto. The build drops the default rustls
+  feature set for native-tls, generates the self-signed ACP transport
+  certificate with OpenSSL rather than rcgen (whose only backends, ring and
+  aws-lc-rs, compile crypto into the binary), and sets OPENSSL_NO_VENDOR so
+  openssl-sys cannot fall back to a vendored OpenSSL. Without this the
+  release FIPS payload scan rejects the image.

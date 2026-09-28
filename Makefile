@@ -171,13 +171,13 @@ controller-agent-push: controller-agent-build ## Build and push the controller's
 # --platform build would put that one binary in every entry of the manifest.
 GOOSE_IMAGE ?=
 GOOSE_BUILD_ARG = $(if $(GOOSE_IMAGE),--build-arg GOOSE_IMAGE=$(GOOSE_IMAGE))
-# The default tag carries the version the Containerfile names, so a goose-dist
-# image built before a GOOSE_VERSION bump cannot be silently reused after one:
-# podman's default --pull=missing finds a stale :latest and says nothing, and
-# you debug the new goose against the old binary. CI never sees this default,
-# the action passes its own version+digest name.
-GOOSE_DIST_VERSION := $(shell sed -n 's/^ARG GOOSE_VERSION=//p' images/agent-base/Containerfile | head -1)
-GOOSE_DIST_IMG ?= localhost/goose-dist:$(GOOSE_DIST_VERSION)
+# Include the pinned source, build recipe, and downstream patches in the tag.
+# $(shell) swallows a non-zero exit, so guard the empty case rather than
+# tagging the image `goose-dist:` and silently reusing the wrong binary. The
+# error sits in the recursively expanded GOOSE_DIST_IMG so it fires only when
+# a goose build actually needs the tag, not on every make invocation.
+GOOSE_DIST_VERSION := $(shell bash images/agent-base/patches/cache-key.sh)
+GOOSE_DIST_IMG ?= localhost/goose-dist:$(or $(GOOSE_DIST_VERSION),$(error images/agent-base/patches/cache-key.sh produced no version; run it directly to see why))
 
 .PHONY: goose-dist-build
 goose-dist-build: ## Build just the goose binary as a standalone image, for reuse as GOOSE_IMAGE.

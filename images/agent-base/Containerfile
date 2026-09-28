@@ -35,7 +35,19 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Run `git submodule update --init images/agent-base/goose-src` before building locally.
 WORKDIR /src/goose
 COPY images/agent-base/goose-src/ .
-RUN cargo build --release -p goose-cli --bin goose \
+COPY images/agent-base/patches/ /tmp/goose-patches/
+
+# Goose must carry no crypto of its own and use the system OpenSSL, or
+# check-payload fails the release scan. OPENSSL_NO_VENDOR stops openssl-sys
+# from compiling its own copy; the feature set and the patch keep rustls,
+# aws-lc-rs and ring out. See images/agent-base/patches/README.md.
+# The two checks either side of the build are the scan's pass condition --
+# don't drop them.
+ENV OPENSSL_NO_VENDOR=1
+RUN git apply /tmp/goose-patches/goose-system-crypto.patch \
+    && bash /tmp/goose-patches/verify-dependencies.sh \
+    && cargo build --locked --release -p goose-cli --bin goose --no-default-features --features native-tls,aws-providers,disable-update \
+    && ldd target/release/goose | grep -q 'libcrypto.so.3' \
     && mv target/release/goose /usr/local/bin/goose
 
 # Just the binary, so what CI caches and reloads is ~100MB rather than the
@@ -71,9 +83,14 @@ RUN CGO_ENABLED=1 GOEXPERIMENT=strictfipsruntime go build -tags strictfipsruntim
 # --- Runtime stage ---
 FROM registry.access.redhat.com/ubi10/ubi:latest
 
+# openssl-fips-provider is already in the UBI base; naming it is what keeps a
+# future base-image change from silently removing the FIPS module that goose
+# and the harness both link against.
 RUN dnf install -y \
     git \
     ca-certificates \
+    openssl-libs \
+    openssl-fips-provider \
     bzip2 \
     tar \
     && dnf clean all

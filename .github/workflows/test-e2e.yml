@@ -59,6 +59,10 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          # goose is built from images/agent-base/goose-src, so a cache miss
+          # here compiles from the submodule. Without this the directory is
+          # empty and the build fails inside the container.
+          submodules: true
 
       - name: Setup Go
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
